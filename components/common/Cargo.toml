@@ -14,6 +14,8 @@ log = "*"
 pbr = "*"
 regex = "*"
 retry = "*"
+serde = "*"
+serde_derive = "*"
 term = "*"
 time = "*"
 toml = { version = "*", default-features = false }

@@ -1,0 +1,21 @@
+syntax = "proto2";
+
+// Encapsulate all possible sources we can install packages from.
+enum InstallSource {
+  // Install from a remote hosting the package
+  Ident = 0;
+  // Install from a local archive file
+  Archive = 1;
+}
+
+// The relationship of a service with peers in the same service group.
+enum Topology {
+  Standalone = 0;
+  Leader = 1;
+}
+
+enum UpdateStrategy {
+  None = 0;
+  AtOnce = 1;
+  Rolling = 2;
+}

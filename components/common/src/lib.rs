@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 #![cfg_attr(feature="clippy", feature(plugin))]
 #![cfg_attr(feature="clippy", plugin(clippy))]
 
@@ -24,6 +25,9 @@ extern crate log;
 extern crate pbr;
 extern crate regex;
 extern crate retry;
+extern crate serde;
+#[macro_use]
+extern crate serde_derive;
 #[cfg(test)]
 extern crate tempdir;
 extern crate term;

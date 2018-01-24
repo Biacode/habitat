@@ -24,11 +24,13 @@ extern crate ansi_term;
 extern crate libc;
 #[macro_use]
 extern crate clap;
+extern crate futures;
 extern crate time;
 extern crate url;
 extern crate tabwriter;
+extern crate tokio_core;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::env;
 use std::io::{self, Write};
@@ -41,6 +43,7 @@ use std::str::FromStr;
 use clap::{App, ArgMatches};
 use common::command::package::install::InstallSource;
 use common::ui::{UI, Coloring, NONINTERACTIVE_ENVVAR};
+use futures::prelude::*;
 use hcore::channel;
 use hcore::crypto::{self, default_cache_key_path, SymKey};
 #[cfg(windows)]
@@ -54,10 +57,14 @@ use hcore::service::{ApplicationEnvironment, ServiceGroup};
 use hcore::url::{bldr_url_from_env, default_bldr_url};
 use launcher_client::{LauncherCli, ERR_NO_RETRY_EXCODE, OK_NO_RETRY_EXCODE};
 use tabwriter::TabWriter;
+use tokio_core::reactor;
 use url::Url;
 
 use sup::VERSION;
 use sup::config::{GossipListenAddr, GOSSIP_DEFAULT_PORT};
+use sup::ctl_gateway;
+use sup::ctl_gateway::client::SrvClient;
+use sup::ctl_gateway::codec::SrvMessage;
 use sup::error::{Error, Result, SupError};
 use sup::feat;
 use sup::command;
@@ -65,7 +72,8 @@ use sup::http_gateway;
 use sup::http_gateway::ListenAddr;
 use sup::manager::{Manager, ManagerConfig, ServiceStatus};
 use sup::manager::service::{DesiredState, ServiceBind, Topology, UpdateStrategy};
-use sup::manager::service::{CompositeSpec, ServiceSpec, StartStyle};
+use sup::manager::service::{CompositeSpec, ServiceSpec, Spec, StartStyle};
+use sup::protocols;
 use sup::util;
 
 /// Our output key
@@ -206,7 +214,9 @@ fn cli<'a, 'b>() -> App<'a, 'b> {
             (@arg LISTEN_GOSSIP: --("listen-gossip") +takes_value {valid_listen_gossip}
                 "The listen address for the gossip system [default: 0.0.0.0:9638]")
             (@arg LISTEN_HTTP: --("listen-http") +takes_value {valid_listen_http}
-                "The listen address for the HTTP gateway [default: 0.0.0.0:9631]")
+                "The listen address for the HTTP Gateway [default: 0.0.0.0:9631]")
+            (@arg LISTEN_CTL: --("listen-ctl") +takes_value {valid_listen_http}
+                "The listen address for the Control Gateway [default: 0.0.0.0:9632]")
             (@arg NAME: --("override-name") +takes_value
                 "The name of the Supervisor if launching more than one [default: default]")
             (@arg ORGANIZATION: --org +takes_value
@@ -242,6 +252,8 @@ fn cli<'a, 'b>() -> App<'a, 'b> {
                 "The listen address for the gossip system [default: 0.0.0.0:9638]")
             (@arg LISTEN_HTTP: --("listen-http") +takes_value {valid_listen_http}
                 "The listen address for the HTTP gateway [default: 0.0.0.0:9631]")
+            (@arg LISTEN_CTL: --("listen-ctl") +takes_value {valid_listen_http}
+                "The listen address for the Control Gateway [default: 0.0.0.0:9632]")
             (@arg NAME: --("override-name") +takes_value
                 "The name for the state directory if launching more than one Supervisor \
                 [default: default]")
@@ -376,6 +388,8 @@ fn cli<'a, 'b>() -> App<'a, 'b> {
                 "The listen address for the gossip system [default: 0.0.0.0:9638]")
             (@arg LISTEN_HTTP: --("listen-http") +takes_value {valid_listen_http}
                 "The listen address for the HTTP gateway [default: 0.0.0.0:9631]")
+            (@arg LISTEN_CTL: --("listen-ctl") +takes_value {valid_listen_http}
+                "The listen address for the Control Gateway [default: 0.0.0.0:9632]")
             (@arg NAME: --("override-name") +takes_value
                 "The name of the Supervisor if launching more than one [default: default]")
             (@arg ORGANIZATION: --org +takes_value
@@ -411,6 +425,8 @@ fn cli<'a, 'b>() -> App<'a, 'b> {
                 "The listen address for the gossip system [default: 0.0.0.0:9638]")
             (@arg LISTEN_HTTP: --("listen-http") +takes_value {valid_listen_http}
                 "The listen address for the HTTP gateway [default: 0.0.0.0:9631]")
+            (@arg LISTEN_CTL: --("listen-ctl") +takes_value {valid_listen_http}
+                "The listen address for the Control Gateway [default: 0.0.0.0:9632]")
             (@arg NAME: --("override-name") +takes_value
                 "The name for the state directory if launching more than one Supervisor \
                 [default: default]")
@@ -488,187 +504,42 @@ fn sub_config(m: &ArgMatches) -> Result<()> {
 fn sub_load(m: &ArgMatches) -> Result<()> {
     toggle_verbosity(m);
     toggle_color(m);
-
     let cfg = mgrcfg_from_matches(m)?;
-    let install_source = install_source_from_input(m)?;
-
-    // TODO (CM): should load be able to download new artifacts if
-    // you're re-loading with --force?
-    // If we've already got a spec for this thing, we don't want to
-    // inadvertently download a new version
-
-    match existing_specs_for_ident(&cfg, install_source.as_ref().clone())? {
-        None => {
-            // We don't have any record of this thing; let's set it
-            // up!
-            //
-            // This will install the latest version from Builder if no
-            // package can be found locally that satisfies the given
-            // identifier.
-            let installed =
-                install_package_if_not_present(&install_source, &bldr_url(m), &channel(m))?;
-
-            let original_ident = install_source.as_ref();
-            let mut specs = generate_new_specs_from_package(original_ident, &installed, m)?;
-
-            for spec in specs.iter_mut() {
-                // "load" == persistent services, by definition
-                spec.start_style = StartStyle::Persistent;
-                Manager::save_spec_for(&cfg, spec)?;
-                outputln!("The {} service was successfully loaded", spec.ident);
-            }
-
-            // Only saves a composite spec if it's, well, a composite
-            if let Ok(composite_spec) =
-                CompositeSpec::from_package_install(&original_ident, &installed)
-            {
-                Manager::save_composite_spec_for(&cfg, &composite_spec)?;
-                outputln!(
-                    "The {} composite was successfully loaded",
-                    composite_spec.ident()
-                );
-            }
-            Ok(())
+    let mut core = reactor::Core::new().unwrap();
+    let mut msg = SrvMessage::<protocols::ctl::SvcLoad>::new();
+    match install_source_from_input(m)? {
+        InstallSource::Archive(archive) => {
+            msg.set_source(archive.path.to_string_lossy().into_owned());
         }
-        Some(spec) => {
-            // We've seen this service / composite before. Thus `load`
-            // basically acts as a way to edit spec files on the
-            // command line. As a result, we a) check that you
-            // *really* meant to change an existing spec, and b) DO
-            // NOT download a potentially new version of the package
-            // in question
-
-            if !m.is_present("FORCE") {
-                // TODO (CM): make this error reflect composites
-                return Err(sup_error!(Error::ServiceLoaded(spec.ident().clone())));
-            }
-
-            match spec {
-                Spec::Service(mut service_spec) => {
-                    service_spec.ident = install_source.as_ref().clone();
-                    update_spec_from_input(&mut service_spec, m)?;
-                    service_spec.start_style = StartStyle::Persistent;
-
-                    // Only install if we don't have something
-                    // locally; otherwise you could potentially
-                    // upgrade each time you load.
-                    //
-                    // Also make sure you're pulling from where you're
-                    // supposed to be pulling from!
-                    install_package_if_not_present(
-                        &install_source,
-                        &service_spec.bldr_url,
-                        &service_spec.channel,
-                    )?;
-
-                    Manager::save_spec_for(&cfg, &service_spec)?;
-                    outputln!("The {} service was successfully loaded", service_spec.ident);
-                    Ok(())
-                }
-                Spec::Composite(composite_spec, mut existing_service_specs) => {
-                    if install_source.as_ref() == composite_spec.ident() {
-                        let composite_package =
-                            match util::pkg::installed(composite_spec.package_ident()) {
-                                Some(package) => package,
-                                // TODO (CM): this should be a proper error
-                                None => unreachable!(),
-                            };
-
-                        update_composite_service_specs(
-                            &mut existing_service_specs,
-                            &composite_package,
-                            m,
-                        )?;
-
-                        for service_spec in existing_service_specs.iter() {
-                            Manager::save_spec_for(&cfg, service_spec)?;
-                            outputln!("The {} service was successfully loaded", service_spec.ident);
-                        }
-                        outputln!(
-                            "The {} composite was successfully loaded",
-                            composite_spec.ident()
-                        );
-                    } else {
-                        // It changed!
-                        // OK, here's the deal.
-                        //
-                        // We're going to install a new composite if
-                        // we need to in order to satisfy the spec
-                        // we've now got. That also means that the
-                        // services that are currently running may get
-                        // unloaded (because they are no longer in the
-                        // composite), and new services may start
-                        // (because they were added to the composite).
-
-                        let installed_package = install_package_if_not_present(
-                            &install_source,
-                            // This (updating from the command-line
-                            // args) is a difference from
-                            // force-loading a spec, because
-                            // composites don't auto-update themselves
-                            // like services can.
-                            &bldr_url(m),
-                            &channel(m),
-                        )?;
-
-                        // Generate new specs from the new composite package and
-                        // CLI inputs
-                        let new_service_specs = generate_new_specs_from_package(
-                            install_source.as_ref(),
-                            &installed_package,
-                            m,
-                        )?;
-
-                        // Delete any specs that are not in the new
-                        // composite
-                        let mut old_spec_names = HashSet::new();
-                        for s in existing_service_specs.iter() {
-                            old_spec_names.insert(s.ident.name.clone());
-                        }
-                        let mut new_spec_names = HashSet::new();
-                        for s in new_service_specs.iter() {
-                            new_spec_names.insert(s.ident.name.clone());
-                        }
-
-                        let specs_to_delete: HashSet<_> =
-                            old_spec_names.difference(&new_spec_names).collect();
-                        for spec in existing_service_specs.iter() {
-                            if specs_to_delete.contains(&spec.ident.name) {
-                                let file = Manager::spec_path_for(&cfg, spec);
-                                outputln!("Unloading {:?}", file);
-                                std::fs::remove_file(&file).map_err(|err| {
-                                    sup_error!(Error::ServiceSpecFileIO(file, err))
-                                })?;
-                            }
-                        }
-                        // <-- end of deletion
-
-                        // Save all the new specs. If there are
-                        // services that exist in both composites,
-                        // their service spec files will have the same
-                        // name, so they'll be taken care of here (we
-                        // don't need to treat them differently)
-                        for spec in new_service_specs.iter() {
-                            Manager::save_spec_for(&cfg, spec)?;
-                            outputln!("The {} service was successfully loaded", spec.ident);
-                        }
-
-                        // Generate and save the new spec
-                        let new_composite_spec = CompositeSpec::from_package_install(
-                            install_source.as_ref(),
-                            &installed_package,
-                        )?;
-                        Manager::save_composite_spec_for(&cfg, &new_composite_spec)?;
-                        outputln!(
-                            "The {} composite was successfully loaded",
-                            new_composite_spec.ident()
-                        );
-                    }
-                    Ok(())
-                }
-            }
+        InstallSource::Ident(ident) => {
+            msg.set_source(ident.to_string());
         }
     }
+    if let Some(app_env) = get_app_env_from_input(m)? {
+        msg.set_application_environment(app_env.to_string());
+    }
+    // opts.binds = get_binds_from_input(m);
+    // opts.composite_binds = composite_binds_from_input(m);
+    // opts.bldr_url = bldr_url_from_input(m);
+    // opts.bldr_channel = channel_from_input(m);
+    // opts.config_from = get_config_from_input(m);
+    msg.set_force(!m.is_present("FORCE"));
+    // opts.group = get_group_from_input(m);
+    // opts.svc_encrypted_password = get_password_from_input(m);
+    // opts.topology = get_topology_from_input(m);
+    // opts.update_strategy = get_strategy_from_input(m);
+    let conn = SrvClient::connect(&cfg.ctl_listen, &cfg.ctl_auth_key)
+        .wait()
+        .unwrap();
+    println!("sending, {:?}", msg);
+    let req = conn.call(msg).for_each(|reply| {
+        println!("got back: {:?}", reply);
+        Ok(())
+    });
+    if let Err(err) = core.run(req) {
+        println!("load error: {:?}", err);
+    }
+    Ok(())
 }
 
 fn sub_unload(m: &ArgMatches) -> Result<()> {
@@ -680,7 +551,7 @@ fn sub_unload(m: &ArgMatches) -> Result<()> {
 
     // Gather up the paths to all the spec files we care about. This
     // includes all service specs as well as any composite spec.
-    let spec_paths = match existing_specs_for_ident(&cfg, ident)? {
+    let spec_paths = match Manager::existing_specs_for_ident(&cfg, ident)? {
         Some(Spec::Service(spec)) => vec![Manager::spec_path_for(&cfg, &spec)],
         Some(Spec::Composite(composite_spec, specs)) => {
             let mut paths = Vec::with_capacity(specs.len() + 1);
@@ -717,94 +588,95 @@ fn sub_sh(m: &ArgMatches) -> Result<()> {
 }
 
 fn sub_start(m: &ArgMatches, launcher: LauncherCli) -> Result<()> {
-    toggle_verbosity(m);
-    toggle_color(m);
-
-    let cfg = mgrcfg_from_matches(m)?;
-
-    if !fs::am_i_root() {
-        let mut ui = ui();
-        ui.warn(
-            "Running the Habitat Supervisor with root or superuser privileges is recommended",
-        )?;
-        ui.br()?;
-    }
-
-    let install_source = install_source_from_input(m)?;
-    let original_ident: &PackageIdent = install_source.as_ref();
-
-    // NOTE: As coded, if you try to start a service from a hart file,
-    // but you already have a spec for that service (regardless of
-    // version), you're not going to ever install your hart file, and
-    // the spec isn't going to be updated to point to that exact
-    // version.
-
-    let updated_specs = match existing_specs_for_ident(&cfg, original_ident.clone())? {
-        Some(Spec::Service(mut spec)) => {
-            let mut updated_specs = vec![];
-            if spec.desired_state == DesiredState::Down {
-                spec.desired_state = DesiredState::Up;
-                updated_specs.push(spec);
-            }
-            updated_specs
-        }
-        Some(Spec::Composite(_, service_specs)) => {
-            let mut updated_specs = vec![];
-            for mut spec in service_specs {
-                if spec.desired_state == DesiredState::Down {
-                    spec.desired_state = DesiredState::Up;
-                    updated_specs.push(spec);
-                }
-            }
-            updated_specs
-        }
-        None => {
-            // We don't have any specs for this thing yet, so we'll
-            // need to make some. If we don't already have installed
-            // software that satisfies the given identifier, then
-            // we'll install the latest thing that will
-            // suffice. Otherwise, we'll just use what we find in the
-            // local cache of software.
-            let installed_package =
-                install_package_if_not_present(&install_source, &bldr_url(m), &channel(m))?;
-            let new_specs =
-                generate_new_specs_from_package(&original_ident, &installed_package, m)?;
-
-            // Saving the composite spec here, because we currently
-            // need the PackageInstall to create it! It'll only create
-            // a composite spec if the package is itself a composite.
-            if let Ok(composite_spec) =
-                CompositeSpec::from_package_install(&original_ident, &installed_package)
-            {
-                Manager::save_composite_spec_for(&cfg, &composite_spec)?;
-            }
-
-            new_specs
-        }
-    };
-
-    let specs_changed = updated_specs.len() > 0;
-
-    for spec in updated_specs.iter() {
-        Manager::save_spec_for(&cfg, spec)?;
-    }
-
-    if Manager::is_running(&cfg)? {
-        if specs_changed {
-            outputln!(
-                "Supervisor starting {}. See the Supervisor output for more details.",
-                original_ident
-            );
-            Ok(())
-        } else {
-            // TODO (CM): somehow, this doesn't actually seem to be
-            // exiting with a non-zero exit code
-            process::exit(OK_NO_RETRY_EXCODE);
-        }
-    } else {
-        let mut manager = Manager::load(cfg, launcher)?;
-        manager.run()
-    }
+    Ok(())
+    // toggle_verbosity(m);
+    // toggle_color(m);
+    //
+    // let cfg = mgrcfg_from_matches(m)?;
+    //
+    // if !fs::am_i_root() {
+    //     let mut ui = ui();
+    //     ui.warn(
+    //         "Running the Habitat Supervisor with root or superuser privileges is recommended",
+    //     )?;
+    //     ui.br()?;
+    // }
+    //
+    // let install_source = install_source_from_input(m)?;
+    // let original_ident: &PackageIdent = install_source.as_ref();
+    //
+    // // NOTE: As coded, if you try to start a service from a hart file,
+    // // but you already have a spec for that service (regardless of
+    // // version), you're not going to ever install your hart file, and
+    // // the spec isn't going to be updated to point to that exact
+    // // version.
+    //
+    // let updated_specs = match Manager::existing_specs_for_ident(&cfg, original_ident.clone())? {
+    //     Some(Spec::Service(mut spec)) => {
+    //         let mut updated_specs = vec![];
+    //         if spec.desired_state == DesiredState::Down {
+    //             spec.desired_state = DesiredState::Up;
+    //             updated_specs.push(spec);
+    //         }
+    //         updated_specs
+    //     }
+    //     Some(Spec::Composite(_, service_specs)) => {
+    //         let mut updated_specs = vec![];
+    //         for mut spec in service_specs {
+    //             if spec.desired_state == DesiredState::Down {
+    //                 spec.desired_state = DesiredState::Up;
+    //                 updated_specs.push(spec);
+    //             }
+    //         }
+    //         updated_specs
+    //     }
+    //     None => {
+    //         // We don't have any specs for this thing yet, so we'll
+    //         // need to make some. If we don't already have installed
+    //         // software that satisfies the given identifier, then
+    //         // we'll install the latest thing that will
+    //         // suffice. Otherwise, we'll just use what we find in the
+    //         // local cache of software.
+    //         let installed_package =
+    //             install_package_if_not_present(&install_source, &bldr_url(m), &channel(m))?;
+    //         let new_specs =
+    //             generate_new_specs_from_package(&original_ident, &installed_package, m)?;
+    //
+    //         // Saving the composite spec here, because we currently
+    //         // need the PackageInstall to create it! It'll only create
+    //         // a composite spec if the package is itself a composite.
+    //         if let Ok(composite_spec) =
+    //             CompositeSpec::from_package_install(&original_ident, &installed_package)
+    //         {
+    //             Manager::save_composite_spec_for(&cfg, &composite_spec)?;
+    //         }
+    //
+    //         new_specs
+    //     }
+    // };
+    //
+    // let specs_changed = updated_specs.len() > 0;
+    //
+    // for spec in updated_specs.iter() {
+    //     Manager::save_spec_for(&cfg, spec)?;
+    // }
+    //
+    // if Manager::is_running(&cfg)? {
+    //     if specs_changed {
+    //         outputln!(
+    //             "Supervisor starting {}. See the Supervisor output for more details.",
+    //             original_ident
+    //         );
+    //         Ok(())
+    //     } else {
+    //         // TODO (CM): somehow, this doesn't actually seem to be
+    //         // exiting with a non-zero exit code
+    //         process::exit(OK_NO_RETRY_EXCODE);
+    //     }
+    // } else {
+    //     let mut manager = Manager::load(cfg, launcher)?;
+    //     manager.run()
+    // }
 }
 
 fn sub_status(m: &ArgMatches) -> Result<()> {
@@ -821,7 +693,7 @@ fn sub_status(m: &ArgMatches) -> Result<()> {
     match m.value_of("PKG_IDENT") {
         Some(pkg) => {
             let ident = PackageIdent::from_str(pkg)?;
-            let specs = match existing_specs_for_ident(&cfg, ident)? {
+            let specs = match Manager::existing_specs_for_ident(&cfg, ident)? {
                 Some(Spec::Service(spec)) => vec![spec],
                 Some(Spec::Composite(_, specs)) => specs,
                 None => {
@@ -887,7 +759,7 @@ fn sub_stop(m: &ArgMatches) -> Result<()> {
 
     // PKG_IDENT is required, so unwrap() is safe
     let ident = PackageIdent::from_str(m.value_of("PKG_IDENT").unwrap())?;
-    let mut specs = match existing_specs_for_ident(&cfg, ident)? {
+    let mut specs = match Manager::existing_specs_for_ident(&cfg, ident)? {
         Some(Spec::Service(spec)) => vec![spec],
         Some(Spec::Composite(_, specs)) => specs,
         None => vec![],
@@ -915,64 +787,6 @@ fn sub_term(m: &ArgMatches) -> Result<()> {
 // Internal Implementation Details
 ////////////////////////////////////////////////////////////////////////
 
-/// Helper enum to abstract over spec type.
-///
-/// Currently needed only here. Don't bother moving anywhere because
-/// ServiceSpecs AND CompositeSpecs will be going away soon anyway.
-enum Spec {
-    Service(ServiceSpec),
-    Composite(CompositeSpec, Vec<ServiceSpec>),
-}
-
-impl Spec {
-    /// We need to get at the identifier of a spec, regardless of
-    /// which kind it is.
-    fn ident(&self) -> &PackageIdent {
-        match self {
-            &Spec::Composite(ref s, _) => s.ident(),
-            &Spec::Service(ref s) => s.ident.as_ref(),
-        }
-    }
-}
-
-/// Given a `PackageIdent`, return current specs if they exist. If
-/// the package is a standalone service, only that spec will be
-/// returned, but if it is a composite, the composite spec as well as
-/// the specs for all the services in the composite will be returned.
-fn existing_specs_for_ident(cfg: &ManagerConfig, ident: PackageIdent) -> Result<Option<Spec>> {
-    let default_spec = ServiceSpec::default_for(ident.clone());
-    let spec_file = Manager::spec_path_for(cfg, &default_spec);
-
-    // Try it as a service first
-    if let Ok(spec) = ServiceSpec::from_file(&spec_file) {
-        Ok(Some(Spec::Service(spec)))
-    } else {
-        // Try it as a composite next
-        let composite_spec_file = Manager::composite_path_by_ident(&cfg, &ident);
-        match CompositeSpec::from_file(composite_spec_file) {
-            Ok(composite_spec) => {
-                let fs_root_path = Path::new(&*fs::FS_ROOT_PATH);
-                let package =
-                    PackageInstall::load(composite_spec.package_ident(), Some(fs_root_path))?;
-                let mut specs = vec![];
-
-                let services = package.pkg_services()?;
-                for service in services {
-                    let spec = ServiceSpec::from_file(Manager::spec_path_for(
-                        cfg,
-                        &ServiceSpec::default_for(service),
-                    ))?;
-                    specs.push(spec);
-                }
-
-                Ok(Some(Spec::Composite(composite_spec, specs)))
-            }
-            // Looks like we have no specs for this thing at all
-            Err(_) => Ok(None),
-        }
-    }
-}
-
 fn mgrcfg_from_matches(m: &ArgMatches) -> Result<ManagerConfig> {
     let mut cfg = ManagerConfig::default();
 
@@ -985,6 +799,10 @@ fn mgrcfg_from_matches(m: &ArgMatches) -> Result<ManagerConfig> {
     if let Some(addr_str) = m.value_of("LISTEN_HTTP") {
         cfg.http_listen = http_gateway::ListenAddr::from_str(addr_str)?;
     }
+    if let Some(addr_str) = m.value_of("LISTEN_CTL") {
+        cfg.ctl_listen = ctl_gateway::ListenAddr::from_str(addr_str)?;
+    }
+    cfg.ctl_auth_key = "letmein".to_string();
     if let Some(name_str) = m.value_of("NAME") {
         cfg.name = Some(String::from(name_str));
         outputln!("");
@@ -1099,25 +917,32 @@ fn install_source_from_input(m: &ArgMatches) -> Result<InstallSource> {
 // ServiceSpec Modification Functions
 ////////////////////////////////////////////////////////////////////////
 
+fn get_group_from_input(m: &ArgMatches) -> Option<String> {
+    m.value_of("GROUP").map(ToString::to_string)
+}
+
 /// If the user supplied a --group option, set it on the
 /// spec. Otherwise, we inherit the default value in the ServiceSpec,
 /// which is "default".
 fn set_group_from_input(spec: &mut ServiceSpec, m: &ArgMatches) {
-    if let Some(g) = m.value_of("GROUP") {
-        spec.group = g.to_string();
-    }
+    spec.group = get_group_from_input(m).expect("GROUP not set")
 }
 
 /// If the user provides both --application and --environment options,
-/// parse and set the value on the spec. Otherwise, we inherit the
-/// default value of the ServiceSpec, which is None
-fn set_app_env_from_input(spec: &mut ServiceSpec, m: &ArgMatches) -> Result<()> {
+/// parse and set the value on the spec.
+fn get_app_env_from_input(m: &ArgMatches) -> Result<Option<ApplicationEnvironment>> {
     if let (Some(app), Some(env)) = (m.value_of("APPLICATION"), m.value_of("ENVIRONMENT")) {
-        spec.application_environment = Some(ApplicationEnvironment::new(
+        Ok(Some(ApplicationEnvironment::new(
             app.to_string(),
             env.to_string(),
-        )?);
+        )?))
+    } else {
+        Ok(None)
     }
+}
+
+fn set_app_env_from_input(spec: &mut ServiceSpec, m: &ArgMatches) -> Result<()> {
+    spec.application_environment = get_app_env_from_input(m)?;
     Ok(())
 }
 
@@ -1148,23 +973,38 @@ fn set_channel(spec: &mut ServiceSpec, m: &ArgMatches) {
     spec.channel = channel(m);
 }
 
+fn get_topology_from_input(m: &ArgMatches) -> Option<Topology> {
+    m.value_of("TOPOLOGY").and_then(
+        |f| Topology::from_str(f).ok(),
+    )
+}
+
 /// Set a topology value only if specified by the user as a CLI
 /// argument.
 fn set_topology_from_input(spec: &mut ServiceSpec, m: &ArgMatches) {
-    if let Some(t) = m.value_of("TOPOLOGY") {
-        // unwrap() is safe, because the input is validated by
-        // `valid_topology`
-        spec.topology = Topology::from_str(t).unwrap();
-    }
+    spec.topology = get_topology_from_input(m).unwrap_or_default()
+}
+
+fn get_strategy_from_input(m: &ArgMatches) -> Option<UpdateStrategy> {
+    m.value_of("STRATEGY").and_then(
+        |f| UpdateStrategy::from_str(f).ok(),
+    )
 }
 
 /// Set an update strategy only if specified by the user as a CLI
 /// argument.
 fn set_strategy_from_input(spec: &mut ServiceSpec, m: &ArgMatches) {
-    if let Some(s) = m.value_of("STRATEGY") {
-        // unwrap() is safe, because the input is validated by `valid_update_strategy`
-        spec.update_strategy = UpdateStrategy::from_str(s).unwrap();
+    spec.update_strategy = get_strategy_from_input(m).unwrap_or_default()
+}
+
+fn get_binds_from_input(m: &ArgMatches) -> Result<Vec<ServiceBind>> {
+    let mut binds = vec![];
+    if let Some(bind_strs) = m.values_of("BIND") {
+        for bind_str in bind_strs {
+            binds.push(ServiceBind::from_str(bind_str)?);
+        }
     }
+    Ok(binds)
 }
 
 /// Set bind values if given on the command line.
@@ -1173,13 +1013,7 @@ fn set_strategy_from_input(spec: &mut ServiceSpec, m: &ArgMatches) {
 /// set using this, as we do not have a mechanism to distinguish
 /// between the different services within the composite.
 fn set_binds_from_input(spec: &mut ServiceSpec, m: &ArgMatches) -> Result<()> {
-    if let Some(bind_strs) = m.values_of("BIND") {
-        let mut binds = Vec::new();
-        for bind_str in bind_strs {
-            binds.push(ServiceBind::from_str(bind_str)?);
-        }
-        spec.binds = binds;
-    }
+    spec.binds = get_binds_from_input(m)?;
     Ok(())
 }
 
@@ -1212,7 +1046,7 @@ fn composite_binds_from_input(m: &ArgMatches) -> Result<HashMap<String, Vec<Serv
                 // It's a composite bind
                 let service_name = parts[0];
                 let bind = format!("{}:{}", parts[1], parts[2]);
-                let mut binds = map.entry(service_name.to_string()).or_insert(vec![]);
+                let binds = map.entry(service_name.to_string()).or_insert(vec![]);
                 binds.push(ServiceBind::from_str(&bind)?);
             } else {
                 // You supplied a 2-part (i.e., standalone service)
@@ -1227,33 +1061,45 @@ fn composite_binds_from_input(m: &ArgMatches) -> Result<HashMap<String, Vec<Serv
     Ok(map)
 }
 
+fn get_config_from_input(m: &ArgMatches) -> Option<PathBuf> {
+    if let Some(ref config_from) = m.value_of("CONFIG_DIR") {
+        outputln!("");
+        outputln!(
+            "WARNING: Setting '--config-from' should only be used in development, not production!"
+        );
+        outputln!("");
+        Some(PathBuf::from(config_from))
+    } else {
+        None
+    }
+}
+
 /// Set a custom config directory if given on the command line.
 ///
 /// NOTE: At the moment, this should not be used for composite
 /// services, as we do not have a mechanism to distinguish between the
 /// different services within the composite.
 fn set_config_from_input(spec: &mut ServiceSpec, m: &ArgMatches) -> Result<()> {
-    if let Some(ref config_from) = m.value_of("CONFIG_DIR") {
-        spec.config_from = Some(PathBuf::from(config_from));
-        outputln!("");
-        outputln!(
-            "WARNING: Setting '--config-from' should only be used in development, not production!"
-        );
-        outputln!("");
-    }
+    spec.config_from = get_config_from_input(m);
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn set_password_from_input(spec: &mut ServiceSpec, m: &ArgMatches) -> Result<()> {
+fn get_password_from_input(m: &ArgMatches) -> Result<Option<String>> {
     if let Some(password) = m.value_of("PASSWORD") {
-        spec.svc_encrypted_password = Some(encrypt(password.to_string())?);
+        Ok(Some(encrypt(password.to_string())?))
+    } else {
+        Ok(None)
     }
-    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn set_password_from_input(_: &mut ServiceSpec, _: &ArgMatches) -> Result<()> {
+fn get_password_from_input(m: &ArgMatches) -> Result<Option<String>> {
+    Ok(None)
+}
+
+fn set_password_from_input(spec: &mut ServiceSpec, m: &ArgMatches) -> Result<()> {
+    spec.svc_encrypted_password = get_password_from_input(m)?;
     Ok(())
 }
 
@@ -1524,44 +1370,6 @@ fn install_package_if_not_present(
             util::pkg::install(&mut ui(), bldr_url, install_source, channel)
         }
     }
-}
-
-/// Given an installed package, generate a spec (or specs, in the case
-/// of composite packages!) from it and the arguments passed in on the
-/// command line.
-fn generate_new_specs_from_package(
-    original_ident: &PackageIdent,
-    package: &PackageInstall,
-    m: &ArgMatches,
-) -> Result<Vec<ServiceSpec>> {
-    let specs = match package.pkg_type()? {
-        PackageType::Standalone => {
-            let spec = new_service_spec(original_ident.clone(), m)?;
-            vec![spec]
-        }
-        PackageType::Composite => {
-            let composite_name = &package.ident().name;
-
-            // All the service specs will be customized copies of
-            // this.
-            let base_spec = base_composite_service_spec(composite_name, m)?;
-
-            let bind_map = package.bind_map()?;
-            let mut cli_composite_binds = composite_binds_from_input(m)?;
-
-            let services = package.pkg_services()?;
-            let mut specs: Vec<ServiceSpec> = Vec::with_capacity(services.len());
-            for service in services {
-                // Customize each service's spec as appropriate
-                let mut spec = base_spec.clone();
-                spec.ident = service;
-                set_composite_binds(&mut spec, &bind_map, &mut cli_composite_binds)?;
-                specs.push(spec);
-            }
-            specs
-        }
-    };
-    Ok(specs)
 }
 
 fn update_composite_service_specs(

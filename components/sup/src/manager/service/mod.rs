@@ -52,6 +52,7 @@ use error::{Error, Result, SupError};
 use fs;
 use manager;
 use census::{ServiceFile, CensusRing, ElectionStatus};
+use protocols;
 use templating::RenderContext;
 use sys::abilities;
 
@@ -59,8 +60,9 @@ pub use self::config::{Cfg, UserConfigPath};
 pub use self::health::{HealthCheck, SmokeCheck};
 pub use self::package::Pkg;
 pub use self::composite_spec::CompositeSpec;
-pub use self::spec::{DesiredState, ServiceBind, ServiceSpec, StartStyle};
+pub use self::spec::{DesiredState, IntoServiceSpec, ServiceBind, ServiceSpec, Spec, StartStyle};
 pub use self::supervisor::ProcessState;
+pub use protocols::types::{Topology, UpdateStrategy};
 
 static LOGKEY: &'static str = "SR";
 
@@ -399,8 +401,8 @@ impl Service {
                 let reload = self.compile_hooks(&ctx);
 
                 // If the configuration has changed, execute the `reload` and `reconfigure` hooks.
-                // Note that the configuration does not necessarily change every time the user config has (e.g.
-                // when only a comment has been added to the latter)
+                // Note that the configuration does not necessarily change every time the user
+                // config has (e.g. when only a comment has been added to the latter)
                 let reconfigure = self.compile_configuration(&ctx);
 
                 (reload, reconfigure)
@@ -792,13 +794,6 @@ impl fmt::Display for Service {
     }
 }
 
-/// The relationship of a service with peers in the same service group.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Topology {
-    Standalone,
-    Leader,
-}
-
 impl Topology {
     fn as_str(&self) -> &str {
         match *self {
@@ -848,13 +843,6 @@ impl serde::Serialize for Topology {
     {
         serializer.serialize_str(self.as_str())
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum UpdateStrategy {
-    None,
-    AtOnce,
-    Rolling,
 }
 
 impl UpdateStrategy {

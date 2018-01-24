@@ -31,6 +31,7 @@ use serde::{self, Deserialize};
 use toml;
 
 use super::{Topology, UpdateStrategy};
+use super::composite_spec::CompositeSpec;
 use error::{Error, Result, SupError};
 
 static LOGKEY: &'static str = "SS";
@@ -71,6 +72,26 @@ impl FromStr for DesiredState {
     }
 }
 
+/// Helper enum to abstract over spec type.
+///
+/// Currently needed only here. Don't bother moving anywhere because
+/// ServiceSpecs AND CompositeSpecs will be going away soon anyway.
+pub enum Spec {
+    Service(ServiceSpec),
+    Composite(CompositeSpec, Vec<ServiceSpec>),
+}
+
+impl Spec {
+    /// We need to get at the identifier of a spec, regardless of
+    /// which kind it is.
+    pub fn ident(&self) -> &PackageIdent {
+        match self {
+            &Spec::Composite(ref s, _) => s.ident(),
+            &Spec::Service(ref s) => s.ident.as_ref(),
+        }
+    }
+}
+
 pub fn deserialize_application_environment<'de, D>(
     d: D,
 ) -> result::Result<Option<ApplicationEnvironment>, D::Error>
@@ -85,6 +106,52 @@ where
     } else {
         Ok(None)
     }
+}
+
+pub trait IntoServiceSpec {
+    // Only use this for standalone services!
+    fn into_spec(self, spec: &mut ServiceSpec);
+
+    /// All specs in a composite currently share a lot of the same
+    /// information. Here, we create a "base spec" that we can clone and
+    /// further customize for each individual service as needed.
+    fn into_composite_spec(self, spec: &mut ServiceSpec);
+
+    // fn update_composite_service_specs(
+    //     spec: &mut Vec<ServiceSpec>,
+    //     package: &PackageInstall,
+    //     m: &ArgMatches,
+    // ) -> Result<()> {
+    //     let bind_map = package.bind_map()?;
+    //     // TODO (CM): maybe not mutable?
+    //     let mut cli_composite_binds = composite_binds_from_input(m)?;
+    //
+    //     let update_binds = m.values_of("BIND").is_some();
+    //
+    //     for spec in spec.iter_mut() {
+    //         // The Builder URL and channel have default values; we only want to
+    //         // change them if the user specified something!
+    //         set_bldr_url_from_input(spec, m);
+    //         set_channel_from_input(spec, m);
+    //
+    //         set_app_env_from_input(spec, m)?;
+    //         set_group_from_input(spec, m);
+    //         set_strategy_from_input(spec, m);
+    //         set_topology_from_input(spec, m);
+    //
+    //         // No setting of config or password either; see notes in
+    //         // `base_composite_service_spec` for more.
+    //
+    //         // Just as with standalone services, we don't do anything to
+    //         // the binds unless you've specified new ones on the CLI. For
+    //         // composites, such binds can be thought of as binds for the
+    //         // overall composite.
+    //         if update_binds {
+    //             set_composite_binds(spec, &bind_map, &mut cli_composite_binds)?;
+    //         }
+    //     }
+    //     Ok(())
+    // }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
