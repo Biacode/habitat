@@ -750,6 +750,7 @@ fn sub_pkg_install() -> App<'static, 'static> {
         (@arg BINLINK: -b --binlink "Binlink all binaries from installed package(s)")
         (@arg FORCE: -f --force "Overwrite existing binlinks")
         (@arg AUTH_TOKEN: -z --auth +takes_value "Authentication token for Builder")
+        (@arg OFFLINE: --offline "Install packages in offline mode")
     )
 }
 

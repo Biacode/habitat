@@ -44,6 +44,7 @@ use std::result::Result as StdResult;
 
 use depot_client::{self, Client};
 use depot_client::Error::APIError;
+use glob;
 use hcore;
 use hcore::fs::cache_key_path;
 use hcore::crypto::{artifact, SigKeyPair};
@@ -156,6 +157,18 @@ impl AsRef<PackageIdent> for InstallSource {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum InstallMode {
+    Online,
+    Offline,
+}
+
+impl Default for InstallMode {
+    fn default() -> Self {
+        InstallMode::Online
+    }
+}
+
 /// Represents a release channel on a Builder Depot.
 // TODO fn: this type could be further developed and generalized outside this module
 struct Channel<'a>(&'a str);
@@ -255,6 +268,7 @@ pub fn start<P1, P2>(
     fs_root_path: P1,
     artifact_cache_path: P2,
     token: Option<&str>,
+    install_mode: &InstallMode,
 ) -> Result<PackageInstall>
 where
     P1: AsRef<Path>,
@@ -271,6 +285,7 @@ where
     };
 
     let task = InstallTask::new(
+        install_mode,
         url,
         channel,
         product,
@@ -287,6 +302,7 @@ where
 }
 
 struct InstallTask<'a> {
+    install_mode: &'a InstallMode,
     depot_client: Client,
     channel: Channel<'a>,
     fs_root_path: &'a Path,
@@ -297,6 +313,7 @@ struct InstallTask<'a> {
 
 impl<'a> InstallTask<'a> {
     fn new(
+        install_mode: &'a InstallMode,
         url: &str,
         channel: Channel<'a>,
         product: &str,
@@ -306,6 +323,7 @@ impl<'a> InstallTask<'a> {
         key_cache_path: &'a Path,
     ) -> Result<Self> {
         Ok(InstallTask {
+            install_mode: install_mode,
             depot_client: Client::new(url, product, version, Some(fs_root_path))?,
             channel: channel,
             fs_root_path: fs_root_path,
@@ -321,7 +339,7 @@ impl<'a> InstallTask<'a> {
     ///
     /// However, if the identifier is _not_ fully-qualified, the
     /// latest version from the given channel will be installed
-    /// instead.
+    /// instead, assuming a newer version is not found locally.
     ///
     /// In either case, the identifier returned will be the
     /// fully-qualified identifier of package that was infstalled
@@ -340,6 +358,21 @@ impl<'a> InstallTask<'a> {
         // determine if we need to get a more recent version or not.
         let target_ident = if ident.fully_qualified() {
             FullyQualifiedPackageIdent::from(ident)?
+        } else if self.is_offline() {
+            ui.status(
+                Status::Determining,
+                format!(
+                    "latest version of {} locally installed or cached (offline)",
+                    &ident
+                ),
+            )?;
+            match self.latest_installed_or_cached(&ident) {
+                Ok(i) => i,
+                Err(Error::PackageNotFound) => {
+                    return Err(Error::OfflinePackageNotFound(ident.clone()));
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             ui.status(
                 Status::Determining,
@@ -349,7 +382,7 @@ impl<'a> InstallTask<'a> {
                     self.channel
                 ),
             )?;
-            match self.fetch_latest_pkg_ident_for(&ident, token) {
+            let mut latest = match self.fetch_latest_pkg_ident_for(&ident, token) {
                 Ok(latest_ident) => latest_ident,
                 Err(Error::DepotClient(APIError(StatusCode::NotFound, _))) => {
                     self.recommend_channels(ui, &ident, token)?;
@@ -359,7 +392,23 @@ impl<'a> InstallTask<'a> {
                     debug!("error fetching ident: {:?}", e);
                     return Err(e);
                 }
+            };
+            // If a newer release is installed on disk or cached, use that one and don't bother
+            // downloading a known-older release.
+            if let Ok(latest_local) = self.latest_installed_or_cached(&ident) {
+                if latest_local.as_ref() > latest.as_ref() {
+                    ui.status(
+                        Status::Found,
+                        format!(
+                            "newer version locally ({}) than remotely ({})",
+                            &latest_local,
+                            latest.as_ref()
+                        ),
+                    )?;
+                    latest = latest_local;
+                }
             }
+            latest
         };
 
         match self.installed_package(&target_ident) {
@@ -541,6 +590,8 @@ impl<'a> InstallTask<'a> {
                 "Found {} in artifact cache, skipping remote download",
                 ident
             );
+        } else if self.is_offline() {
+            return Err(Error::OfflineArtifactNotFound(ident.as_ref().clone()));
         } else {
             if retry(
                 RETRIES,
@@ -574,6 +625,95 @@ impl<'a> InstallTask<'a> {
     /// identifier, if it exists.
     fn installed_package(&self, ident: &FullyQualifiedPackageIdent) -> Option<PackageInstall> {
         PackageInstall::load(ident.as_ref(), Some(self.fs_root_path)).ok()
+    }
+
+    /// Checks for the latest installed package or cached artifact that matches a given package
+    /// identifier and returns a fully qualified package identifer if a match exists.
+    fn latest_installed_or_cached(
+        &self,
+        ident: &PackageIdent,
+    ) -> Result<FullyQualifiedPackageIdent> {
+        let latest_installed = self.latest_installed_package(&ident).map(
+            |i| i.ident().clone(),
+        );
+        let latest_cached = {
+            match self.latest_cached_artifact(&ident) {
+                Some(mut artifact) => Some(artifact.ident()?),
+                None => None,
+            }
+        };
+        debug!(
+                "latest installed: {:?}, latest_cached: {:?}",
+                &latest_installed,
+                &latest_cached,
+            );
+        let latest = match (latest_installed, latest_cached) {
+            (Some(pkg_install), None) => pkg_install,
+            (None, Some(pkg_artifact)) => pkg_artifact,
+            (Some(pkg_install), Some(pkg_artifact)) => {
+                if pkg_install > pkg_artifact {
+                    pkg_install
+                } else {
+                    pkg_artifact
+                }
+            }
+            (None, None) => return Err(Error::PackageNotFound),
+        };
+        debug!("offline mode: winner: {:?}", &latest);
+
+        FullyQualifiedPackageIdent::from(latest)
+    }
+
+    fn latest_installed_package(&self, ident: &PackageIdent) -> Option<PackageInstall> {
+        PackageInstall::load(ident, Some(self.fs_root_path)).ok()
+    }
+
+    fn latest_cached_artifact(&self, ident: &PackageIdent) -> Option<PackageArchive> {
+        let filename_glob = {
+            let mut ident = ident.clone();
+            if ident.version.is_none() {
+                ident.version = Some(String::from("_VERSION_"));
+            }
+            if ident.release.is_none() {
+                ident.release = Some(String::from("_RELEASE_"));
+            }
+            match ident.archive_name() {
+                Some(name) => name.replace("_VERSION_", "?*").replace("_RELEASE_", "?*"),
+                None => return None,
+            }
+        };
+        let glob_path = self.artifact_cache_path.join(filename_glob);
+        let glob_path = glob_path.to_string_lossy();
+        debug!("looking for cached artifacts, glob={}", glob_path.as_ref());
+
+        let mut latest: Vec<(PackageIdent, PackageArchive)> = Vec::with_capacity(1);
+        for file in glob::glob(glob_path.as_ref())
+            .expect("glob pattern should compile")
+            .filter_map(StdResult::ok)
+        {
+            let mut artifact = PackageArchive::new(&file);
+            let artifact_ident = artifact.ident().ok();
+            if let None = artifact_ident {
+                continue;
+            }
+            let artifact_ident = artifact_ident.unwrap();
+            if artifact_ident.origin == ident.origin && artifact_ident.name == ident.name {
+                if latest.is_empty() {
+                    latest.push((artifact_ident, artifact));
+                } else {
+                    if artifact_ident > latest[0].0 {
+                        let _ = latest.pop();
+                        latest.push((artifact_ident, artifact));
+                    }
+                }
+            }
+        }
+
+        if latest.is_empty() {
+            None
+        } else {
+            Some(latest.pop().unwrap().1)
+        }
     }
 
     fn is_artifact_cached(&self, ident: &FullyQualifiedPackageIdent) -> bool {
@@ -635,22 +775,26 @@ impl<'a> InstallTask<'a> {
     }
 
     fn fetch_origin_key(&self, ui: &mut UI, name_with_rev: &str) -> Result<()> {
-        ui.status(
-            Status::Downloading,
-            format!("{} public origin key", &name_with_rev),
-        )?;
-        let (name, rev) = parse_name_with_rev(&name_with_rev)?;
-        self.depot_client.fetch_origin_key(
-            &name,
-            &rev,
-            self.key_cache_path,
-            ui.progress(),
-        )?;
-        ui.status(
-            Status::Cached,
-            format!("{} public origin key", &name_with_rev),
-        )?;
-        Ok(())
+        if self.is_offline() {
+            return Err(Error::OfflineOriginKeyNotFound(name_with_rev.to_string()));
+        } else {
+            ui.status(
+                Status::Downloading,
+                format!("{} public origin key", &name_with_rev),
+            )?;
+            let (name, rev) = parse_name_with_rev(&name_with_rev)?;
+            self.depot_client.fetch_origin_key(
+                &name,
+                &rev,
+                self.key_cache_path,
+                ui.progress(),
+            )?;
+            ui.status(
+                Status::Cached,
+                format!("{} public origin key", &name_with_rev),
+            )?;
+            Ok(())
+        }
     }
 
     /// Copies the artifact to the local artifact cache directory
@@ -699,5 +843,9 @@ impl<'a> InstallTask<'a> {
         artifact.verify(&self.key_cache_path)?;
         debug!("Verified {} signed by {}", ident, &nwr);
         Ok(())
+    }
+
+    fn is_offline(&self) -> bool {
+        self.install_mode == &InstallMode::Offline
     }
 }

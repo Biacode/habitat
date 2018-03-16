@@ -38,7 +38,7 @@ use std::thread;
 
 use clap::{ArgMatches, Shell};
 
-use common::command::package::install::InstallSource;
+use common::command::package::install::{InstallMode, InstallSource};
 use common::ui::UI;
 use hcore::channel;
 use hcore::crypto::{init, default_cache_key_path, SigKeyPair};
@@ -563,6 +563,11 @@ fn sub_pkg_install(ui: &mut UI, m: &ArgMatches) -> Result<()> {
     let channel = channel_from_matches(m);
     let install_sources = install_sources_from_matches(m)?;
     let token = maybe_auth_token(ui, &m);
+    let install_mode = if m.is_present("OFFLINE") {
+        InstallMode::Offline
+    } else {
+        InstallMode::Online
+    };
 
     init();
 
@@ -577,6 +582,7 @@ fn sub_pkg_install(ui: &mut UI, m: &ArgMatches) -> Result<()> {
             &*FS_ROOT,
             &cache_artifact_path(Some(&*FS_ROOT)),
             token.as_ref().map(String::as_str),
+            &install_mode,
         )?;
 
         if m.is_present("BINLINK") {
